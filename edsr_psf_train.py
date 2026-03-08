@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-edsr_psf_train.py - EDSR Multi-band Auto-training Version
-Core Upgrades: Automatically iterate training for all AIA wavelengths, each wavelength uses exclusive configuration, fully isolated paths
-Retained All Original Features: Parameter count statistics, training timing, fixed random seed, visualization, GPU1 exclusive training
-Adaptation Modifications: Removed gradient/flux loss functions, only retained LR reprojection L1 loss, fully preserved all validation metrics
-"""
-
 import os
 import math
 import re
