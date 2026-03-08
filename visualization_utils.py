@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+"""
+visualization_utils.py - EDSR 训练可视化专用工具库（A&A/Solar Physics投稿版）
+核心原则：
+1. 每一张图回答一个物理问题，拒绝工程化展示
+2. 仅保留物理一致性验证核心可视化，删除所有冗余内容
+3. 严格遵循AIA官方可视化规范，符合太阳物理领域审稿习惯
+适配：纯EDSR模型 + 物理正则化(梯度+通量+频谱) + LR重投影损失
+适配新增：GPU0版训练代码（语义更名+指标映射：deg/clean/rec + lr_reproj_L1→psf_match_l1）
+新增功能：
+1. 耀斑自动识别+自动放大区域裁剪（替换原固定放大区域）
+2. AIA规范差分图（seismic色标+自适应对称阈值）
+3. 保存Clean/Rec/Deg数据为FITS格式（太阳物理标准）
+4. 2024宁静期+2021爆发期双时期独立可视化，各一张图+单独保存FITS/PNG
+修复：
+1. 空数组归约操作防御性校验（解决94Å波段zero-size array报错）
+2. 放大区域坐标强制有效性校验
+3. FITS头非ASCII字符兼容（Å→Angstrom）
+4. 修复返回值解包数量不匹配错误（too many values to unpack）
+"""
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+# AIA可视化核心依赖（太阳物理领域硬标准）
+import sunpy.map
+from astropy.visualization import ImageNormalize, LogStretch, LinearStretch
+from scipy.ndimage import gaussian_filter, label, find_objects  # 新增：耀斑识别依赖
+# 新增：FITS文件处理核心库（太阳物理标准）
+from astropy.io import fits
+
+# ===================== AIA官方可视化核心配置（太阳物理领域标准） =====================
+# AIA波段→官方色标映射
+WAVELENGTH_TO_CMAP = {
+    94: 'sdoaia94',
+    131: 'sdoaia131',
+    171: 'sdoaia171',
+    193: 'sdoaia193',
+    211: 'sdoaia211',
+    304: 'sdoaia304',
+    335: 'sdoaia335'
+}
+
+# AIA官方拉伸配置（避免过曝/细节丢失）- 强化百分比限制，适配不同波段噪声特性
+AIA_OFFICIAL_CONFIG = {
+    94: (30, 99.9, True),    
+    131: (25, 99.9, True),   
+    171: (0, 99.5, False),  
+    193: (1, 99.5, False),  
+    211: (1, 99.5, False),  
+    304: (30, 99.9, True),   
+    335: (30, 99.9, True)    
+}
+SUPPORTED_WAVELENGTHS = list(AIA_OFFICIAL_CONFIG.keys())
+HIGH_NOISE_WAVELENGTHS = [94, 131, 335]  # 仅高噪声波段轻度降噪
+SMOOTH_SIGMA = 0  # 修改：适配耀斑识别的轻度降噪（从0.0→0.5）
+# 新增：耀斑识别配置（可通过cfg覆盖）
+CROP_EXTEND = 100     # 耀斑核心扩展像素数
+MIN_FLARE_PIXELS = 50  # 最小耀斑像素数（过滤噪声）
+DIFF_PERCENTILE = 99   # 差分图阈值百分位（过滤极端值）
+# 备用默认放大区域（耀斑识别失败时使用）
+ZOOM_REGION_DEFAULT = {'x1': 200, 'x2': 600, 'y1': 200, 'y2': 600}
+# 最小有效区域尺寸（防止裁剪出空数组）
+MIN_ZOOM_SIZE = 400
+
+# ===================== 全局绘图配置（论文级，极简风格） =====================
+plt.rcParams.update({
+    "font.family": ["DejaVu Sans"],  # 移除中文字体，仅保留英文标准字体
+    "axes.unicode_minus": False,
+    "figure.figsize": (24, 12),  # 加宽画布适配放大区域展示
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "savefig.bbox": 'tight',
+    "savefig.pad_inches": 0.1,
+    "axes.labelsize": 12,
+    "axes.titlesize": 14,
+    "xtick.labelsize": 8,       # 减小刻度字体，避免堆叠
+    "ytick.labelsize": 8,       # 减小刻度字体，避免堆叠
+})
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# ===================== 核心工具函数（新增耀斑识别+AIA规范差分图） =====================
+def convert_numpy_to_python(obj):
+    """递归转换numpy类型为Python原生类型，解决JSON序列化问题"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(v) for v in obj]
+    else:
+        return obj
+
+def mild_denoise_aia_data(data, wavelength):
+    """仅高噪声波段轻度降噪，保留物理结构（适配耀斑识别）"""
+    # 空数据校验
+    if data.size == 0 or np.all(np.isnan(data)):
+        print(f"⚠️ 降噪前数据为空/全为NaN（波段{wavelength}Å），跳过降噪")
+        return data
+    
+    if wavelength in HIGH_NOISE_WAVELENGTHS:
+        denoised_data = np.copy(data)
+        valid_mask = ~np.isnan(denoised_data)
+        if np.sum(valid_mask) == 0:
+            print(f"⚠️ 无有效数据可降噪（波段{wavelength}Å）")
+            return denoised_data
+        denoised_data[valid_mask] = gaussian_filter(denoised_data[valid_mask], sigma=SMOOTH_SIGMA)
+        return denoised_data
+    return data
+
+def get_aia_visual_config(wavelength):
+    """获取AIA官方可视化配置（保证领域规范性）"""
+    # 提取纯数字波段号（兼容2024/2021命名，如94_2024→94，2021_171→171）
+    wave_str = str(wavelength)
+    pure_wave = ''.join([c for c in wave_str if c.isdigit()])
+    pure_wave = int(pure_wave) if pure_wave else 171
+    
+    pure_wave = pure_wave if pure_wave in SUPPORTED_WAVELENGTHS else 171
+    cmap_name = WAVELENGTH_TO_CMAP.get(pure_wave, 'sdoaia171')
+    cmap = plt.get_cmap(cmap_name) if cmap_name in plt.colormaps() else plt.get_cmap('gray')
+    min_pct, max_pct, use_log = AIA_OFFICIAL_CONFIG[pure_wave]
+    return cmap, min_pct, max_pct, use_log
+
+def get_percentile_limits(data, min_pct, max_pct):
+    """计算数据的百分比限制，过滤NaN值（新增空数组防御）"""
+    valid_data = data[~np.isnan(data)]
+    # 空数据防御
+    if len(valid_data) == 0:
+        print(f"⚠️ 无有效数据计算百分比限制，使用默认值(0,1)")
+        return 0, 1
+    vmin = np.percentile(valid_data, min_pct)
+    vmax = np.percentile(valid_data, max_pct)
+    # 防止vmin == vmax导致的可视化问题
+    if vmin == vmax:
+        vmax = vmin + 1e-6 if vmin == 0 else vmin * 1.01
+    return vmin, vmax
+
+# ===================== 新增：耀斑自动识别核心函数 =====================
+def auto_detect_flare(data, wavelength):
+    """耀斑自动识别核心函数，返回核心区域坐标（带空数据防御）"""
+    # 空数据防御
+    if data.size == 0 or np.all(np.isnan(data)):
+        print(f"⚠️ 耀斑识别失败：数据为空/全为NaN（波段{wavelength}Å）")
+        return None
+    
+    data_denoise = mild_denoise_aia_data(data.copy(), wavelength)
+    # 核心修复：解包4个返回值（原错误：只解包3个）
+    _, min_pct, max_pct, _ = get_aia_visual_config(wavelength)
+    # 计算耀斑阈值
+    valid_data = data_denoise[~np.isnan(data_denoise)]
+    if len(valid_data) == 0:
+        print(f"⚠️ 耀斑识别失败：无有效数据（波段{wavelength}Å）")
+        return None
+    
+    flare_thresh = np.percentile(valid_data, max_pct)
+    flare_mask = data_denoise >= flare_thresh
+    labeled_mask, num_features = label(flare_mask)
+    
+    if num_features == 0:
+        print(f"⚠️ 耀斑识别失败：未检测到亮区（波段{wavelength}Å）")
+        return None
+    
+    # 找到最大的耀斑区域
+    flare_sizes = [np.sum(labeled_mask == i) for i in range(1, num_features+1)]
+    max_flare_idx = np.argmax(flare_sizes) + 1
+    max_flare_size = flare_sizes[max_flare_idx-1]
+    
+    if max_flare_size < MIN_FLARE_PIXELS:
+        print(f"⚠️ 耀斑识别失败：最大亮区仅{max_flare_size}像素（<{MIN_FLARE_PIXELS}），判定为噪声")
+        return None
+    
+    # 获取耀斑核心坐标
+    flare_slices = find_objects(labeled_mask == max_flare_idx)[0]
+    x1, y1 = flare_slices[1].start, flare_slices[0].start
+    x2, y2 = flare_slices[1].stop, flare_slices[0].stop
+    print(f"✅ 耀斑识别成功：核心区域({x1},{y1})-({x2},{y2})，像素数{max_flare_size}")
+    return {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+
+def get_crop_coords(flare_region, data_shape, extend):
+    """计算耀斑区域裁剪坐标（边界校验+四周扩展）"""
+    height, width = data_shape
+    x1, y1 = flare_region['x1'], flare_region['y1']
+    x2, y2 = flare_region['x2'], flare_region['y2']
+    
+    # 扩展耀斑区域
+    x1 = max(0, x1 - extend)
+    y1 = max(0, y1 - extend)
+    x2 = min(width, x2 + extend)
+    y2 = min(height, y2 + extend)
+    
+    return {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+
+# ===================== 新增：AIA规范差分图归一化函数 =====================
+def get_single_diff_normalize(diff_data, percentile):
+    """为单张差分图计算自适应归一化配置（对称阈值+seismic色标）"""
+    valid_diff = diff_data[~np.isnan(diff_data)]
+    if len(valid_diff) == 0:
+        print(f"⚠️ 差分图无有效数据，使用默认阈值")
+        return plt.get_cmap('seismic'), ImageNormalize(vmin=-1, vmax=1, stretch=LinearStretch()), -1, 1
+    
+    abs_max = np.percentile(np.abs(valid_diff), percentile)
+    vmin = -abs_max
+    vmax = abs_max
+    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=LinearStretch())
+    cmap = plt.get_cmap('seismic')  # 太阳物理偏差分析标准色标
+    print(f"✅ 差分图可视化配置：阈值[{vmin:.2f}, {vmax:.2f}]，色标seismic")
+    return cmap, norm, vmin, vmax
+
+def save_aia_fits(data, save_path, wavelength, epoch, data_type):
+    """保存AIA数据为FITS文件（符合太阳物理领域标准，未改动）"""
+    try:
+        if data.size == 0 or np.all(np.isnan(data)):
+            print(f"⚠️ 跳过空数据FITS保存：{save_path}")
+            return False
+        
+        fits_data = np.nan_to_num(data).astype(np.float32)
+        hdu = fits.PrimaryHDU(fits_data)
+        wave_str = str(wavelength)
+        pure_wave = ''.join([c for c in wave_str if c.isdigit()])
+        pure_wave = int(pure_wave) if pure_wave else wavelength
+        hdu.header['WAVE'] = (pure_wave, 'AIA wavelength (Angstrom)')
+        hdu.header['EPOCH'] = (epoch, 'Training epoch')
+        hdu.header['DATATYPE'] = (data_type, 'Data type (Degraded/Clean/Recovered)')
+        hdu.header['CREATED'] = (np.datetime64('now').astype(str), 'File creation time')
+        hdu.header['DATA_PER'] = (wave_str, 'Data period (2024 quiet/2021 flare)')
+        
+        hdu.header['MIN'] = (np.min(fits_data) if fits_data.size > 0 else 0, 'Minimum intensity value')
+        hdu.header['MAX'] = (np.max(fits_data) if fits_data.size > 0 else 1, 'Maximum intensity value')
+        hdu.header['MEAN'] = (np.mean(fits_data) if fits_data.size > 0 else 0.5, 'Mean intensity value')
+        
+        hdul = fits.HDUList([hdu])
+        hdul.writeto(save_path, overwrite=True)
+        hdul.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ FITS保存失败 {save_path}: {str(e)}")
+        return False
+
+def validate_zoom_region(zoom_region, data_shape):
+    """修改：优先使用耀斑识别区域，失败则用默认区域并校验"""
+    height, width = data_shape
+    x1, x2 = zoom_region['x1'], zoom_region['x2']
+    y1, y2 = zoom_region['y1'], zoom_region['y2']
+    
+    # 1. 确保坐标在图像范围内
+    x1 = max(0, min(x1, width-1))
+    x2 = max(0, min(x2, width))
+    y1 = max(0, min(y1, height-1))
+    y2 = max(0, min(y2, height))
+    
+    # 2. 确保最小尺寸满足MIN_ZOOM_SIZE
+    if x2 - x1 < MIN_ZOOM_SIZE:
+        x2 = x1 + MIN_ZOOM_SIZE
+        if x2 > width:
+            x1 = max(0, width - MIN_ZOOM_SIZE)
+            x2 = width
+    if y2 - y1 < MIN_ZOOM_SIZE:
+        y2 = y1 + MIN_ZOOM_SIZE
+        if y2 > height:
+            y1 = max(0, height - MIN_ZOOM_SIZE)
+            y2 = height
+    
+    # 3. 最终校验
+    if x1 >= x2 or y1 >= y2:
+        print(f"⚠️ 放大区域坐标无效，使用默认区域")
+        return ZOOM_REGION_DEFAULT.copy()
+    
+    valid_region = {'x1': x1, 'x2': x2, 'y1': y1, 'y2': y2}
+    print(f"✅ 放大区域校验完成：{valid_region} (图像尺寸: {data_shape})")
+    return valid_region
+
+# ===================== 核心可视化函数（修改：集成耀斑识别+AIA规范差分图） =====================
+def visualize_train_step(epoch, deg, clean, rec, metrics, cfg, lr=None, hr=None, sr=None):
+    """
+    训练/验证轮次可视化（A&A投稿版）- 适配GPU0版训练代码
+    核心修改：
+    1. 耀斑自动识别替换固定放大区域
+    2. 差分图改为AIA规范的seismic色标+自适应对称阈值
+    3. 移除反退化/反卷积相关逻辑，仅保留Clean/Rec对比
+    """
+    # 双时期处理逻辑（未改动）
+    original_wave = getattr(cfg, 'AIA_WAVELENGTH', 171)
+    wave_str = str(original_wave)
+    period_configs = []
+    if '2024' in wave_str:
+        period_configs.append(('quiet_2024', original_wave, 'quiet_2024'))
+    if '2021' in wave_str:
+        period_configs.append(('flare_2021', original_wave, 'flare_2021'))
+    if not period_configs:
+        period_configs.append(('original', original_wave, ''))
+    
+    main_path = None
+    for period_name, period_wave, save_suffix in period_configs:
+        cfg.AIA_WAVELENGTH = period_wave
+        
+        # 1. 获取AIA波段配置
+        try:
+            aia_wavelength = cfg.AIA_WAVELENGTH
+        except:
+            aia_wavelength = 171
+        
+        # 2. 数据预处理（未改动，适配语义更名）
+        deg = deg if deg is not None else lr
+        clean = clean if clean is not None else hr
+        rec = rec if rec is not None else sr
+        deg_np = deg.squeeze().numpy() if torch.is_tensor(deg) else np.squeeze(deg)
+        clean_np = clean.squeeze().numpy() if torch.is_tensor(clean) else np.squeeze(clean)
+        rec_np = rec.squeeze().numpy() if torch.is_tensor(rec) else np.squeeze(rec)
+
+        # 数据校验（未改动）
+        for name, data in zip(['Degraded', 'Clean', 'Recovered'], [deg_np, clean_np, rec_np]):
+            if data.size == 0:
+                raise ValueError(f"❌ {period_name} - {name}数据为空（波段{aia_wavelength}），无法可视化")
+            if len(data.shape) != 2:
+                print(f"⚠️ {period_name} - {name}数据维度异常({data.shape})，强制转为2D")
+                data = data.reshape(-1, data.shape[-1]) if len(data.shape) > 2 else data
+        
+        # 3. 耀斑自动识别 + 放大区域配置（核心修改）
+        # 优先从cfg读取耀斑配置，否则用默认值
+        crop_extend = getattr(cfg, 'CROP_EXTEND', CROP_EXTEND)
+        # 基于Clean数据识别耀斑（物理真值）
+        flare_region = auto_detect_flare(clean_np, aia_wavelength)
+        if flare_region is not None:
+            # 扩展耀斑区域
+            zoom_region = get_crop_coords(flare_region, clean_np.shape, crop_extend)
+        else:
+            # 耀斑识别失败，使用cfg的固定区域或默认区域
+            try:
+                zoom_region = cfg.ZOOM_REGION
+            except:
+                zoom_region = ZOOM_REGION_DEFAULT.copy()
+        # 校验放大区域有效性
+        zoom_region = validate_zoom_region(zoom_region, clean_np.shape)
+        x1, x2, y1, y2 = zoom_region['x1'], zoom_region['x2'], zoom_region['y1'], zoom_region['y2']
+        
+        # 4. 创建输出目录（未改动）
+        os.makedirs(cfg.VIS_OUT_DIR, exist_ok=True)
+        epoch_dir = os.path.join(cfg.VIS_OUT_DIR, f"epoch_{epoch}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        
+        # 5. 轻度降噪（适配耀斑识别，未改动逻辑仅参数调整）
+        deg_np = mild_denoise_aia_data(deg_np, aia_wavelength)
+        clean_np = mild_denoise_aia_data(clean_np, aia_wavelength)
+        rec_np = mild_denoise_aia_data(rec_np, aia_wavelength)
+        
+        # 6. 提取放大区域数据（未改动）
+        deg_zoom = deg_np[y1:y2, x1:x2]
+        clean_zoom = clean_np[y1:y2, x1:x2]
+        rec_zoom = rec_np[y1:y2, x1:x2]
+        
+        # 7. 计算差分图（仅保留Rec-Clean，移除反卷积相关）
+        diff_np = rec_np - clean_np
+        diff_zoom = rec_zoom - clean_zoom if clean_zoom.size > 0 and rec_zoom.size > 0 else np.array([[0]])
+        # AIA规范差分图配置
+        diff_cmap, diff_norm, diff_vmin, diff_vmax = get_single_diff_normalize(diff_np, DIFF_PERCENTILE)
+        diff_zoom_cmap, diff_zoom_norm, diff_zoom_vmin, diff_zoom_vmax = get_single_diff_normalize(diff_zoom, DIFF_PERCENTILE)
+        
+        # 安全归约函数（未改动）
+        def safe_reduction(arr, func, default=0.0):
+            valid_arr = arr[~np.isnan(arr)] if arr.size > 0 else np.array([])
+            return func(valid_arr) if valid_arr.size > 0 else default
+        
+        # 计算差分统计量
+        diff_mean = safe_reduction(diff_np, np.mean, 0.0)
+        diff_std = safe_reduction(diff_np, np.std, 0.0)
+        diff_abs_max = safe_reduction(np.abs(diff_np), np.max, 0.0)
+        diff_mean_zoom = safe_reduction(diff_zoom, np.mean, 0.0)
+        diff_std_zoom = safe_reduction(diff_zoom, np.std, 0.0)
+        diff_abs_max_zoom = safe_reduction(np.abs(diff_zoom), np.max, 0.0)
+        
+        # 8. AIA官方可视化配置（未改动）
+        cmap, min_pct, max_pct, use_log = get_aia_visual_config(aia_wavelength)
+        vmin, vmax = get_percentile_limits(clean_np, min_pct, max_pct)
+        stretch = LogStretch() if use_log else LinearStretch()
+        norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=stretch)
+        
+        # 9. 画布布局（2行4列，未改动布局仅修改差分图绘制）
+        fig = plt.figure(figsize=(24, 12), dpi=300)
+        
+        # 9.1 Degraded图像（未改动）
+        ax1 = plt.subplot(2, 4, 1)
+        im1 = ax1.imshow(deg_np, cmap=cmap, norm=norm)
+        ax1.set_title(f'Degraded Input (AIA {aia_wavelength} | {period_name} | PSF Blur)', fontweight='bold')
+        ax1.axis('off')
+        cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar1.ax.tick_params(labelsize=7)
+        
+        # 9.2 Clean参考（未改动）
+        ax2 = plt.subplot(2, 4, 2)
+        im2 = ax2.imshow(clean_np, cmap=cmap, norm=norm)
+        ax2.set_title(f'Clean Reference (AIA Observation)', fontweight='bold')
+        ax2.axis('off')
+        cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar2.ax.tick_params(labelsize=7)
+        
+        # 9.3 Recovered结果（未改动）
+        ax3 = plt.subplot(2, 4, 3)
+        im3 = ax3.imshow(rec_np, cmap=cmap, norm=norm)
+        ax3.set_title(f'Recovered Output (EDSR)', fontweight='bold')
+        ax3.axis('off')
+        cbar3 = plt.colorbar(im3, ax=ax3, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar3.ax.tick_params(labelsize=7)
+        
+        # 9.4 全局差分图（修改：使用AIA规范seismic色标+自适应阈值）
+        ax4 = plt.subplot(2, 4, 4)
+        im4 = ax4.imshow(diff_np, cmap=diff_cmap, norm=diff_norm)
+        ax4.set_title(f'Difference (Rec - Clean) | Mean: {diff_mean:.4f} | Std: {diff_std:.4f}', fontweight='bold')
+        ax4.axis('off')
+        diff_ticks = np.linspace(diff_vmin, diff_vmax, 5) if diff_abs_max > 0 else [-1, -0.5, 0, 0.5, 1]
+        cbar4 = plt.colorbar(im4, ax=ax4, shrink=0.6, ticks=diff_ticks)
+        cbar4.ax.tick_params(labelsize=7)
+        cbar4.set_label('Intensity Difference', fontsize=8)
+        
+        # 9.5 放大区域 - Clean参考（未改动）
+        ax5 = plt.subplot(2, 4, 5)
+        im5 = ax5.imshow(clean_zoom, cmap=cmap, norm=norm)
+        ax5.set_title(f'Clean Zoom (Flare Region: {x1}:{x2}, {y1}:{y2})', fontweight='bold')
+        ax5.axis('off')
+        cbar5 = plt.colorbar(im5, ax=ax5, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar5.ax.tick_params(labelsize=7)
+        
+        # 9.6 放大区域 - Recovered输出（未改动）
+        ax6 = plt.subplot(2, 4, 6)
+        im6 = ax6.imshow(rec_zoom, cmap=cmap, norm=norm)
+        ax6.set_title(f'Rec Zoom (Flare Region: {x1}:{x2}, {y1}:{y2})', fontweight='bold')
+        ax6.axis('off')
+        cbar6 = plt.colorbar(im6, ax=ax6, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar6.ax.tick_params(labelsize=7)
+        
+        # 9.7 放大区域 - 差分图（修改：使用AIA规范seismic色标+自适应阈值）
+        ax7 = plt.subplot(2, 4, 7)
+        im7 = ax7.imshow(diff_zoom, cmap=diff_zoom_cmap, norm=diff_zoom_norm)
+        ax7.set_title(f'Flare Region Diff | Mean: {diff_mean_zoom:.4f} | Std: {diff_std_zoom:.4f}', fontweight='bold')
+        ax7.axis('off')
+        diff_ticks_zoom = np.linspace(diff_zoom_vmin, diff_zoom_vmax, 5) if diff_abs_max_zoom > 0 else [-1, -0.5, 0, 0.5, 1]
+        cbar7 = plt.colorbar(im7, ax=ax7, shrink=0.6, ticks=diff_ticks_zoom)
+        cbar7.ax.tick_params(labelsize=7)
+        cbar7.set_label('Intensity Difference', fontsize=8)
+        
+        # 9.8 全局图+耀斑区域标注（修改：标注耀斑区域）
+        ax8 = plt.subplot(2, 4, 8)
+        im8 = ax8.imshow(clean_np, cmap=cmap, norm=norm)
+        # 白色矩形框标注耀斑/放大区域
+        rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='white', facecolor='none')
+        ax8.add_patch(rect)
+        ax8.set_title(f'Clean with Flare Region ({x1}:{x2}, {y1}:{y2})', fontweight='bold')
+        ax8.axis('off')
+        cbar8 = plt.colorbar(im8, ax=ax8, shrink=0.6, ticks=np.linspace(vmin, vmax, 5))
+        cbar8.ax.tick_params(labelsize=7)
+        
+        # 10. 水平中心剖面（未改动）
+        fig_profile = plt.figure(figsize=(12, 4), dpi=300)
+        ax_profile = fig_profile.add_subplot(111)
+        center_y = clean_np.shape[0] // 2
+        x = np.arange(clean_np.shape[1])
+        clean_profile = clean_np[center_y, :]
+        rec_profile = rec_np[center_y, :]
+        
+        ax_profile.plot(x, clean_profile, label='Clean Reference', c='red', linewidth=2, alpha=0.8)
+        ax_profile.plot(x, rec_profile, label='Recovered Output', c='blue', linewidth=2, alpha=0.8)
+        ax_profile.set_title(f'Horizontal Profile (AIA {aia_wavelength} | {period_name})', fontweight='bold')
+        ax_profile.set_xlabel('Pixel Position')
+        ax_profile.set_ylabel('Intensity')
+        ax_profile.legend(fontsize=8)
+        ax_profile.grid(True, alpha=0.3)
+        
+        # 11. 保存核心文件（未改动）
+        wave_num = ''.join([c for c in str(aia_wavelength) if c.isdigit()])
+        save_suffix = f"_{save_suffix}" if save_suffix else ""
+        # 主对比图
+        main_path = os.path.join(epoch_dir, f"epoch_{epoch}_core_comparison_{wave_num}A{save_suffix}.png")
+        plt.tight_layout(pad=1.0)
+        fig.savefig(main_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        
+        # 剖面单独保存
+        profile_path = os.path.join(epoch_dir, f"epoch_{epoch}_profile_{wave_num}A{save_suffix}.png")
+        fig_profile.savefig(profile_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig_profile)
+        
+        # 核心指标保存（新增耀斑区域信息）
+        core_metrics = {
+            'epoch': epoch,
+            'aia_wavelength': aia_wavelength,
+            'data_period': period_name,
+            'psf_match_l1': round(metrics.get('lr_reproj_L1', metrics.get('psf_match_l1', 0)), 6),
+            'flux_error': round(metrics.get('flux_error', 0), 2),
+            'pcc': round(metrics.get('pcc', 0), 4),
+            'psnr': round(metrics.get('psnr', 0), 2),
+            'ssim': round(metrics.get('ssim', 0), 4),
+            'edge_preservation': round(metrics.get('edge_preservation', 0), 4),
+            # 新增：耀斑/放大区域信息
+            'flare_detected': flare_region is not None,
+            'zoom_region': zoom_region,
+            'zoom_diff_mean': round(diff_mean_zoom, 4),
+            'zoom_diff_std': round(diff_std_zoom, 4)
+        }
+        metrics_path = os.path.join(epoch_dir, f"epoch_{epoch}_core_metrics_{wave_num}A{save_suffix}.json")
+        with open(metrics_path, 'w') as f:
+            json.dump(convert_numpy_to_python(core_metrics), f, indent=4)
+        
+        # 保存FITS文件（未改动）
+        clean_fits_path = os.path.join(epoch_dir, f"epoch_{epoch}_clean_{wave_num}A{save_suffix}.fits")
+        rec_fits_path = os.path.join(epoch_dir, f"epoch_{epoch}_rec_{wave_num}A{save_suffix}.fits")
+        deg_fits_path = os.path.join(epoch_dir, f"epoch_{epoch}_deg_{wave_num}A{save_suffix}.fits")
+        save_aia_fits(clean_np, clean_fits_path, aia_wavelength, epoch, 'Clean')
+        save_aia_fits(rec_np, rec_fits_path, aia_wavelength, epoch, 'Recovered')
+        save_aia_fits(deg_np, deg_fits_path, aia_wavelength, epoch, 'Degraded')
+        
+        print(f"✅ {period_name} - Epoch {epoch} 投稿版可视化保存完成：")
+        print(f"  - 主对比图(含耀斑放大): {main_path}")
+        print(f"  - 剖面验证图: {profile_path}")
+        print(f"  - 核心指标: {metrics_path}")
+        print(f"  - Clean FITS文件: {clean_fits_path}")
+        print(f"  - Recovered FITS文件: {rec_fits_path}")
+        print(f"  - Degraded FITS文件: {deg_fits_path}")
+
+    # 恢复cfg原始波段名
+    cfg.AIA_WAVELENGTH = original_wave
+    return main_path
+
+# ===================== 训练曲线绘制（未改动） =====================
+def plot_training_curve(metrics_history, cfg):
+    """绘制训练曲线（仅核心物理指标，符合论文要求）- 适配GPU0训练代码（指标映射）"""
+    try:
+        aia_wavelength = cfg.AIA_WAVELENGTH
+        wave_str = str(aia_wavelength)
+        period_suffix = ''
+        if '2024' in wave_str:
+            period_suffix = '_quiet_2024'
+        elif '2021' in wave_str:
+            period_suffix = '_flare_2021'
+        wave_num = ''.join([c for c in wave_str if c.isdigit()])
+        wave_num = int(wave_num) if wave_num else 171
+    except:
+        wave_num = 171
+        period_suffix = ''
+    
+    curve_dir = os.path.join(cfg.VIS_OUT_DIR, f"training_curves_{wave_num}A{period_suffix}")
+    os.makedirs(curve_dir, exist_ok=True)
+    
+    core_curves = [
+        ("psf_match_l1", "LR Reprojection L1 Loss (PSF Match)", "Loss Value", "crimson"),
+        ("flux_error", "Flux Error", "Error (%)", "brown"),
+        ("pcc", "Pearson Correlation Coefficient (PCC)", "PCC Value", "royalblue"),
+        ("psnr", "PSNR", "PSNR (dB)", "blue")
+    ]
+    
+    if len(metrics_history) == 0:
+        print(f"⚠️ 无训练指标数据，跳过曲线绘制")
+        return
+    
+    epochs = [m['epoch'] for m in metrics_history]
+    print(f"\n===== 绘制核心训练曲线（AIA {wave_num}Å {period_suffix.strip('_')}） =====")
+    
+    for metric_key, title, y_label, color in core_curves:
+        metric_vals = [round(m['metrics'].get(metric_key, m['metrics'].get('lr_reproj_L1', 0)), 6) for m in metrics_history]
+        
+        plt.figure(figsize=(10, 4), dpi=300)
+        plt.plot(epochs, metric_vals, linewidth=2, color=color, marker='o', markersize=2)
+        plt.title(f"{title} | AIA {wave_num}Å {period_suffix.strip('_')}", fontweight='bold')
+        plt.xlabel('Epoch', fontsize=10)
+        plt.ylabel(y_label, fontsize=10)
+        plt.xticks(fontsize=8)
+        plt.yticks(fontsize=8)
+        plt.grid(True, alpha=0.3)
+        
+        save_path = os.path.join(curve_dir, f"curve_{metric_key}_{wave_num}A{period_suffix}.png")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"  - 曲线保存: {save_path}")
+    
+    print("===== 核心训练曲线绘制完成 ======")
