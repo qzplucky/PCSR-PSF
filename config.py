@@ -22,7 +22,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0094.fits"
+        "PSF_FILE": ../psf_aia_0094.fits"
     },
     131: {
         "HR_DIR_NAME": "0131-HR",  
@@ -32,7 +32,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0131.fits"
+        "PSF_FILE": "../psf_aia_0131.fits"
     },
     171: {
         "HR_DIR_NAME": "0171-HR", 
@@ -42,7 +42,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0171.fits"
+        "PSF_FILE": "../psf_aia_0171.fits"
     },
     193: {
         "HR_DIR_NAME": "0193-HR", 
@@ -52,7 +52,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0193.fits"
+        "PSF_FILE": "./psf_aia_0193.fits"
     },
     211: {
         "HR_DIR_NAME": "0211-HR", 
@@ -62,7 +62,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0211.fits"
+        "PSF_FILE": "../psf_aia_0211.fits"
     },
     304: {
         "HR_DIR_NAME": "0304-HR",  
@@ -72,7 +72,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0304.fits"
+        "PSF_FILE": "../psf_aia_0304.fits"
     },
     335: {
         "HR_DIR_NAME": "0335-HR",
@@ -82,7 +82,7 @@ AIA_BAND_PARAMS = {
         "HR_PIXEL_SCALE": 2.4,
         "PSF_RAW_SCALE": 0.6,
         "VALID_SIGNAL_THRESH": 0.0045,
-        "PSF_FILE": "/home/zth24029/project/EDSR/PSF/psf_aia_0335.fits"
+        "PSF_FILE": "../psf_aia_0335.fits"
     }
 }
 
